@@ -175,8 +175,8 @@ fun planManualExposure(
  * @param meanLuma average luma of the current frame, 0..255
  * @param currentIso ISO currently applied
  * @param minIso/maxIso sensor limits from `SENSOR_INFO_SENSITIVITY_RANGE`
- * @param targetLuma desired mean luma (default mid-grey); lower it if the scan
- *   area is dominated by the bright sender screen and ISO keeps railing low.
+ * @param targetLuma desired mean luma; see [AUTO_ISO_TARGET_LUMA] for why the
+ *   default is deliberately below mid-grey.
  * @return the next ISO to request, or [currentIso] when no change is warranted
  */
 fun nextAutoIso(
@@ -184,15 +184,40 @@ fun nextAutoIso(
     currentIso: Int,
     minIso: Int,
     maxIso: Int,
-    targetLuma: Double = 128.0,
+    targetLuma: Double = AUTO_ISO_TARGET_LUMA,
 ): Int {
     if (meanLuma <= 1.0 || currentIso <= 0 || minIso <= 0 || maxIso < minIso) return currentIso
     val desired = currentIso * (targetLuma / meanLuma)
     // Damp: move at most 25% of the gap per frame so a bright QR border entering
     // the frame cannot slam ISO across its whole range in a single step.
     val damped = currentIso + (desired - currentIso) * AUTO_ISO_DAMPING
-    return damped.toInt().coerceIn(minIso, maxIso)
+    // Ramp *down* faster than up. Over-exposure destroys QR contrast irrecoverably
+    // (white modules clip to 255 and merge), whereas under-exposure at a locked
+    // shutter merely costs some gain, and the next frame corrects it. Asymmetric
+    // damping makes the loop fail safe: it backs off immediately when the frame
+    // reads bright, but eases in slowly when the frame reads dark.
+    val adjusted = if (damped < currentIso) {
+        currentIso + (damped - currentIso) * AUTO_ISO_DOWN_GAIN
+    } else {
+        damped
+    }
+    return adjusted.toInt().coerceIn(minIso, maxIso)
 }
 
-/** Fraction of the correction applied per analysis frame (see [nextAutoIso]). */
+/** Fraction of the correction applied per analysis frame when raising ISO. */
 const val AUTO_ISO_DAMPING = 0.25
+
+/** Extra factor applied when *lowering* ISO (fail-safe against clipping). */
+const val AUTO_ISO_DOWN_GAIN = 2.5
+
+/**
+ * Target mean luma for the auto-ISO loop.
+ *
+ * Deliberately below mid-grey (128). The scan scene is a bright, self-emissive
+ * sender screen surrounded by a much darker room, so the frame mean is dominated
+ * by dark background: driving the *mean* to 128 forces gain up until the screen —
+ * the only region that matters — clips to pure white, which is exactly what an
+ * over-exposed preview looks like. Settling nearer the dark end keeps the
+ * screen's black modules black while the bright modules stay well inside range.
+ */
+const val AUTO_ISO_TARGET_LUMA = 85.0

@@ -879,16 +879,18 @@ class ScanActivity : ComponentActivity() {
         boundAnalyzer?.shutterLocked = locked
     }
 
-    /** First ISO guess for a fixed shutter: mid-range, then corrected by the loop. */
+    /**
+     * First ISO guess for a fixed shutter, corrected afterwards by [onAnalysisLuma].
+     *
+     * A fixed 400 rather than the midpoint of the sensor range: the midpoint is
+     * 3225 on the reference device, which over-exposes the sender screen the
+     * instant the shutter locks (before the closed loop has run once). 400 is a
+     * typical indoor value, so the loop converges in a few frames from either
+     * side instead of starting pinned in the blown-out region.
+     */
     private fun seedIso(): Int {
-        val r = sensitivityRange
-        if (r == null) return 400
-        val min = r.lower
-        val max = r.upper
-        if (max < min || min <= 0) return 400
-        // Start at half the range: a locked 1/60s on a typical indoor screen lands
-        // near there, so the controller converges in a couple of frames either way.
-        return (min + (max - min) / 2).coerceIn(min, max)
+        val r = sensitivityRange ?: return DEFAULT_SEED_ISO
+        return DEFAULT_SEED_ISO.coerceIn(r.lower, r.upper)
     }
 
     /** Auto-ISO feedback, called (throttled) from the analysis thread. */
@@ -2079,6 +2081,11 @@ class ScanActivity : ComponentActivity() {
         private const val RATE_MIN_DT_MS = 300L
         /** Refresh period of the idle exposure read-out. */
         private const val EXPOSURE_TICK_MS = 1000L
+        /**
+         * ISO used the moment a fixed shutter is applied, before the auto-ISO
+         * loop has measured anything. A typical indoor value — see [seedIso].
+         */
+        private const val DEFAULT_SEED_ISO = 400
         /** Default display/store name when an older TEXT descriptor has no filename. */
         private const val TEXT_RECEIVED_NAME = "文字消息.txt"
 

@@ -84,10 +84,16 @@ class QrStreamAnalyzer(
      * thread. The plane is read via [stride]: `ImageProxy` rows are padded, so a
      * naive `w*h` walk would drift into padding and skewed content (the same
      * trap documented for `VideoFrame.copyTo(I420)` in AGENTS.md).
+     *
+     * The buffer's `limit` is the hard bound on reads: a Y plane may expose fewer
+     * bytes than `stride * height` (the last row is often not padded), so the
+     * computed index is clamped against `limit` rather than assumed valid —
+     * otherwise the very last sampled row throws `IndexOutOfBoundsException`.
      */
     private fun sampleMeanLuma(buf: java.nio.ByteBuffer, width: Int, height: Int, stride: Int): Double {
         val dup = buf.duplicate()
         val base = dup.position()
+        val limit = dup.limit()
         var sum = 0L
         var count = 0
         var y = 0
@@ -95,7 +101,10 @@ class QrStreamAnalyzer(
             val row = base + y * stride
             var x = 0
             while (x < width) {
-                sum += (dup.get(row + x).toInt() and 0xFF)
+                val idx = row + x
+                // Stop at the plane's real end instead of trusting stride*height.
+                if (idx >= limit) return if (count == 0) 0.0 else sum.toDouble() / count
+                sum += (dup.get(idx).toInt() and 0xFF)
                 count++
                 x += LUMA_SAMPLE_STEP
             }

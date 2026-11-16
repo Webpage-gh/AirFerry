@@ -166,7 +166,25 @@ class CameraExposureTest {
 
     @Test
     fun autoIsoHoldsSteadyAtTarget() {
-        assertEquals(400, nextAutoIso(128.0, 400, 50, 6400))
+        // Feeding the controller its own target must produce no change.
+        assertEquals(400, nextAutoIso(AUTO_ISO_TARGET_LUMA, 400, 50, 6400))
+    }
+
+    @Test
+    fun autoIsoTargetIsBelowMidGrey() {
+        // Guards the over-exposure fix: a mid-grey (128) target drives gain up
+        // until the self-emissive sender screen clips to white.
+        assertTrue("target must stay well below 128", AUTO_ISO_TARGET_LUMA < 100.0)
+    }
+
+    @Test
+    fun autoIsoBacksOffFasterThanItRaises() {
+        // Symmetric damping would let a clipped frame linger for many ticks.
+        // Lowering must move further than raising for the same absolute error.
+        val error = 20.0
+        val raised = nextAutoIso(AUTO_ISO_TARGET_LUMA - error, 400, 50, 6400) - 400
+        val lowered = 400 - nextAutoIso(AUTO_ISO_TARGET_LUMA + error, 400, 50, 6400)
+        assertTrue("lowering ($lowered) should exceed raising ($raised)", lowered > raised)
     }
 
     @Test
@@ -207,8 +225,9 @@ class CameraExposureTest {
 
     @Test
     fun autoIsoIgnoresInvalidSensorRange() {
-        assertEquals(400, nextAutoIso(64.0, 400, 0, 6400))
-        assertEquals(400, nextAutoIso(64.0, 400, 6400, 50))
-        assertEquals(0, nextAutoIso(64.0, 0, 50, 6400))
+        // Degenerate ranges must leave the ISO untouched rather than guess.
+        assertEquals(400, nextAutoIso(AUTO_ISO_TARGET_LUMA, 400, 0, 6400))
+        assertEquals(400, nextAutoIso(AUTO_ISO_TARGET_LUMA, 400, 6400, 50))
+        assertEquals(0, nextAutoIso(AUTO_ISO_TARGET_LUMA, 0, 50, 6400))
     }
 }
