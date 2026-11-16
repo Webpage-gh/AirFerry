@@ -3,7 +3,11 @@ package com.airferry.app.ui
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.os.Bundle
 import android.view.WindowManager
 import android.widget.Toast
@@ -13,7 +17,11 @@ import android.util.Size
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.camera2.interop.Camera2CameraControl
+import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.CaptureRequestOptions
+import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview
@@ -46,7 +54,10 @@ import com.airferry.app.scan.BundleParser
 import com.airferry.app.scan.QrDecodePool
 import com.airferry.app.scan.QrStreamAnalyzer
 import com.airferry.app.scan.ReceiverSessionManager
+import com.airferry.app.scan.ShutterSpeed
 import com.airferry.app.scan.TextParser
+import com.airferry.app.scan.nextAutoIso
+import com.airferry.app.scan.planManualExposure
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -71,6 +82,71 @@ class ScanActivity : ComponentActivity() {
 
     /** Parallel QR decode pool (capture → queue → N workers → serialized ingest). */
     private var decodePool: QrDecodePool? = null
+
+    // ---- Fixed-shutter / exposure state ----
+
+    /** Camera bound by [startCameraWithView]; needed to push new exposure options. */
+    private var boundCamera: androidx.camera.core.Camera? = null
+
+    /** Analyzer bound to the active camera; told whether the shutter is locked so
+     *  it can skip the luma sampling that feeds the auto-ISO loop. */
+    private var boundAnalyzer: QrStreamAnalyzer? = null
+
+    /** Range of exposure times this sensor supports (from CameraCharacteristics). */
+    private var exposureRange: Range<Long>? = null
+    /** Range of ISO values this sensor supports. */
+    private var sensitivityRange: Range<Int>? = null
+    /** Whether the device advertises MANUAL_SENSOR (required for AE_MODE=OFF). */
+    private var supportsManualSensor = false
+
+    /** Shutter chosen by the user (persisted in Settings); AUTO by default. */
+    private var currentShutter: ShutterSpeed = ShutterSpeed.AUTO
+    /** Shutter actually applied to the session — differs from [currentShutter] when
+     *  the request was clamped or rejected (then this is AUTO). */
+    private var appliedShutter: ShutterSpeed = ShutterSpeed.AUTO
+    /** True while a fixed shutter is driving exposure (AE is off). */
+    @Volatile
+    private var shutterLocked = false
+    /** ISO currently requested by the auto-ISO loop (0 = not seeded yet). */
+    @Volatile
+    private var currentIso: Int = 0
+
+    /** Exposure time reported by the last CaptureResult (0 = not yet known). */
+    @Volatile
+    private var actualExposureNanos: Long = 0L
+    /** ISO reported by the last CaptureResult (0 = not yet known). */
+    @Volatile
+    private var actualIso: Int = 0
+
+    /** Drives the 1Hz refresh of the exposure read-out while idle. */
+    private val exposureTick = mutableIntStateOf(0)
+    private val exposureTickHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private var exposureTicker: Runnable? = null
+
+    /**
+     * Read-back of the resolved exposure settings.
+     *
+     * CameraX offers no way to observe them: `ImageProxy` carries no exposure
+     * metadata and `Camera2CameraControl` is write-only. This callback is the only
+     * source, and it is what lets the UI show the *real* shutter — including the
+     * AE-chosen value when the user leaves it on AUTO.
+     */
+    private val captureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            try {
+                val exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+                if (exp != null) actualExposureNanos = exp
+                if (iso != null) actualIso = iso
+            } catch (_: Exception) {
+                // A malformed/incomplete result must never disturb the pipeline.
+            }
+        }
+    }
 
     /** Disk-backed assembler for a descriptor-v5 large transfer (null = none in progress). */
     private var segAssembler: com.airferry.app.scan.SegmentAssembler? = null
@@ -156,6 +232,14 @@ class ScanActivity : ComponentActivity() {
         // timeout automatically.
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
 
+        // Shutter speed chosen in Settings (AUTO unless the user opted in). Read
+        // once here: the settings screen is a separate Activity, so the value is
+        // re-read in onResume when the user comes back from it.
+        currentShutter = ShutterSpeed.fromPref(
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getString(ShutterSpeed.PREF_KEY, null)
+        )
+
         // JNI self-test + native ABI version handshake.
         // The version check must come first: a stale `.so` from an older APK
         // lacks the v5 segmented-receive symbol, so `nativeAbiVersion()` throws
@@ -206,6 +290,17 @@ class ScanActivity : ComponentActivity() {
         }
 
         setContent { ScanScreen() }
+
+        // The exposure read-out has to stay live even while idle (the decode-event
+        // driven UI refresh only ticks during a transfer). A 1Hz ticker that only
+        // touches the exposure state is cheaper than refreshing the whole card and
+        // keeps the numbers the user is watching from going stale.
+        exposureTicker = object : Runnable {
+            override fun run() {
+                exposureTick.value = exposureTick.value + 1
+                exposureTickHandler.postDelayed(this, EXPOSURE_TICK_MS)
+            }
+        }.also { exposureTickHandler.postDelayed(it, EXPOSURE_TICK_MS) }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startCamera()
@@ -320,6 +415,20 @@ class ScanActivity : ComponentActivity() {
 
                 Spacer(modifier = Modifier.height(16.dp))
 
+                // Exposure read-out. Shows the *actual* shutter reported by the
+                // camera, so the user can verify what the settings screen did
+                // rather than trusting a label. `appliedShutter` reflects what was
+                // requested; the value after "·" is what the sensor resolved (they
+                // differ when AE is in charge, or if a request was clamped).
+                ExposureChip(
+                    locked = shutterLocked,
+                    requested = appliedShutter,
+                    actualNanos = actualExposureNanos,
+                    actualIso = actualIso,
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+
                 // Action buttons row
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -336,6 +445,54 @@ class ScanActivity : ComponentActivity() {
                     }
                 }
                 Spacer(modifier = Modifier.height(24.dp))
+            }
+        }
+    }
+
+    /**
+     * Live exposure read-out.
+     *
+     * `locked` = a fixed shutter is driving the sensor (AE off). The left side
+     * shows what we asked for, the right side what the camera actually resolved —
+     * the second number is the ground truth and comes from `CaptureResult`, which
+     * is why it can show a real value even on AUTO.
+     */
+    @Composable
+    private fun ExposureChip(
+        locked: Boolean,
+        requested: ShutterSpeed,
+        actualNanos: Long,
+        actualIso: Int,
+    ) {
+        // Observe the ticker so these volatile readings recompose ~1Hz even when no
+        // frames are being decoded.
+        exposureTick.value
+        val actualText = if (actualNanos > 0) formatShutter(actualNanos) else "—"
+        val isoText = if (actualIso > 0) "ISO $actualIso" else ""
+        val label = if (locked) "快门 ${requested.label} · 实测 $actualText"
+                    else "快门 自动 · 实测 $actualText"
+        Surface(
+            shape = RoundedCornerShape(20.dp),
+            color = Color(0xCC1E293B),
+            modifier = Modifier.padding(top = 4.dp)
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Settings,
+                    contentDescription = null,
+                    tint = if (locked) Accent else TextSecondary,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Text(
+                    text = if (isoText.isEmpty()) label else "$label · $isoText",
+                    color = if (locked) TextPrimary else TextSecondary,
+                    fontSize = 12.sp,
+                    fontWeight = if (locked) FontWeight.Bold else FontWeight.Normal
+                )
             }
         }
     }
@@ -453,7 +610,9 @@ class ScanActivity : ComponentActivity() {
         return p
     }
 
-    @androidx.annotation.OptIn(androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
+    @androidx.annotation.OptIn(
+        androidx.camera.camera2.interop.ExperimentalCamera2Interop::class
+    )
     private fun startCameraWithView(previewView: PreviewView) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
         cameraProviderFuture.addListener({
@@ -483,6 +642,12 @@ class ScanActivity : ComponentActivity() {
                     )
                     .build()
 
+                // The analyzer owns the auto-ISO loop and needs to know whether a
+                // fixed shutter is active before it bothers sampling luma.
+                val analyzer = QrStreamAnalyzer(pool)
+                analyzer.onMeanLuma = { mean -> onAnalysisLuma(mean) }
+                boundAnalyzer = analyzer
+
                 fun buildAnalysis(fpsRange: Range<Int>): ImageAnalysis =
                     ImageAnalysis.Builder()
                         .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
@@ -496,24 +661,38 @@ class ScanActivity : ComponentActivity() {
                             )
                         }
                         .build()
-                        .also { it.setAnalyzer(cameraExecutor, QrStreamAnalyzer(pool)) }
+                        .also {
+                            attachExposureReadback(it)
+                            it.setAnalyzer(cameraExecutor, analyzer)
+                        }
 
-                // Pin a steady 60fps so low-light AE can't trade frame rate for a
-                // longer exposure (the on-screen QR is a bright emissive source, so
-                // a fixed 60 is usually fine and reduces motion / rolling-shutter
-                // smear). Some devices reject a fixed [60,60]; fall back to [30,60].
+                // Camera2 view of the selected camera — source of the exposure and
+                // frame-rate capabilities used below (and by the settings screen).
+                val cam2Info = Camera2CameraInfo.from(
+                    cameraProvider.getCameraInfo(CameraSelector.DEFAULT_BACK_CAMERA)
+                )
+                readCameraCapabilities(cam2Info)
+                val fpsRange = chooseFpsRange(cam2Info)
+
                 cameraProvider.unbindAll()
-                try {
+                val camera = try {
                     cameraProvider.bindToLifecycle(
-                        this, CameraSelector.DEFAULT_BACK_CAMERA, preview, buildAnalysis(Range(60, 60))
+                        this, CameraSelector.DEFAULT_BACK_CAMERA, preview, buildAnalysis(fpsRange)
                     )
                 } catch (e: Exception) {
-                    Log.w(TAG, "fixed 60fps bind failed; falling back to 30–60", e)
+                    // Last-resort fallback: if even the capability-derived range is
+                    // rejected, bind with no fps constraint at all rather than
+                    // failing to open the camera entirely.
+                    Log.w(TAG, "bind with fps=$fpsRange failed; rebinding unconstrained", e)
                     cameraProvider.unbindAll()
                     cameraProvider.bindToLifecycle(
-                        this, CameraSelector.DEFAULT_BACK_CAMERA, preview, buildAnalysis(Range(30, 60))
+                        this, CameraSelector.DEFAULT_BACK_CAMERA, preview, buildAnalysis(DEFAULT_FPS_RANGE)
                     )
                 }
+
+                boundCamera = camera
+                // Apply the shutter chosen in Settings (defaults to AUTO).
+                applyShutter(camera)
             } catch (e: Exception) {
                 Log.e(TAG, "Camera bind failed", e)
                 cameraStarted = false
@@ -521,6 +700,227 @@ class ScanActivity : ComponentActivity() {
             }
         }, ContextCompat.getMainExecutor(this))
     }
+
+    /**
+     * Read the exposure/frame-rate capabilities of the active camera.
+     *
+     * Logged at `Log.i` on purpose: release builds strip only `Log.d`/`Log.v`
+     * (see `proguard-rules.pro`), and these values are the first thing needed when
+     * a device behaves unexpectedly. Through v1.2.9 the scanner requested
+     * `[60,60]` on cameras that only advertise a 30fps ceiling; the HAL accepted
+     * the bind but clamped the range, AE ran at a 33ms frame period and settled on
+     * a ~1/30s exposure with no warning anywhere. Printing what the device
+     * actually supports makes that class of failure visible instead of silent.
+     */
+    @androidx.annotation.OptIn(
+        androidx.camera.camera2.interop.ExperimentalCamera2Interop::class
+    )
+    private fun readCameraCapabilities(info: Camera2CameraInfo) {
+        try {
+            val ranges = info.getCameraCharacteristic(
+                CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
+            )
+            exposureRange = info.getCameraCharacteristic(
+                CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE
+            )
+            sensitivityRange = info.getCameraCharacteristic(
+                CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE
+            )
+            val caps = info.getCameraCharacteristic(
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES
+            )
+            supportsManualSensor = caps?.contains(
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR
+            ) == true
+            val hwLevel = info.getCameraCharacteristic(
+                CameraCharacteristics.INFO_SUPPORTED_HARDWARE_LEVEL
+            )
+            Log.i(
+                TAG,
+                "camera caps: fpsRanges=${ranges?.joinToString(" ") { "[${it.lower} ${it.upper}]" }} " +
+                    "exposureRange=${exposureRange?.lower}..${exposureRange?.upper}ns " +
+                    "isoRange=${sensitivityRange?.lower}..${sensitivityRange?.upper} " +
+                    "manualSensor=$supportsManualSensor hwLevel=$hwLevel"
+            )
+            // Cache the exposure range so SettingsActivity can hide presets this
+            // device cannot honor. Written here because this is the only place with
+            // an open camera to read the characteristic from.
+            exposureRange?.let { r ->
+                getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit()
+                    .putLong(ShutterSpeed.PREF_EXPOSURE_MIN, r.lower)
+                    .putLong(ShutterSpeed.PREF_EXPOSURE_MAX, r.upper)
+                    .apply()
+            }
+        } catch (e: Exception) {
+            // Capability queries must never take the camera down: without them the
+            // scanner still works, it just cannot offer a fixed shutter.
+            Log.w(TAG, "camera capability query failed", e)
+        }
+    }
+
+    /**
+     * Pick a frame-rate range the device actually advertises.
+     *
+     * This replaces the previous hard-coded `Range(60, 60)` with its `[30,60]`
+     * fallback. Both values are absent from many devices' capability lists (the
+     * reference device only offers up to `[30,30]`), and an unsupported range does
+     * **not** make `bindToLifecycle` throw — the HAL merely ignores it. So the old
+     * catch-based fallback never ran, the app believed it had pinned 60fps, and the
+     * exposure could silently stretch to the real 33ms frame period.
+     *
+     * Preferring the highest `upper` bound pins the frame period as short as the
+     * device allows, which is both a higher symbol rate and a hard ceiling on how
+     * long AE can stretch the exposure while the shutter is "automatic".
+     */
+    @androidx.annotation.OptIn(
+        androidx.camera.camera2.interop.ExperimentalCamera2Interop::class
+    )
+    private fun chooseFpsRange(info: Camera2CameraInfo): Range<Int> {
+        val ranges = try {
+            info.getCameraCharacteristic(
+                CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES
+            )?.toList()
+        } catch (e: Exception) {
+            Log.w(TAG, "fps range query failed", e)
+            null
+        }
+        if (ranges.isNullOrEmpty()) {
+            Log.w(TAG, "no fps ranges advertised; using unconstrained")
+            return DEFAULT_FPS_RANGE
+        }
+        // Highest upper bound wins; among equals prefer the wider (lower) range so
+        // a dim scene can still trade frame rate for exposure when on AUTO.
+        val best = ranges.maxWithOrNull(compareBy({ it.upper }, { -it.lower })) ?: DEFAULT_FPS_RANGE
+        Log.i(TAG, "fps range chosen=[${best.lower} ${best.upper}] (from ${ranges.size} advertised)")
+        return best
+    }
+
+    /**
+     * Install the per-frame exposure read-back callback.
+     *
+     * Registered on the ImageAnalysis use case (the stream we actually care about)
+     * rather than the camera as a whole, because CameraX surfaces CaptureResults
+     * per use case. Values land in [actualExposureNanos]/[actualIso] and are picked
+     * up by the throttled UI refresh.
+     */
+    @androidx.annotation.OptIn(
+        androidx.camera.camera2.interop.ExperimentalCamera2Interop::class
+    )
+    private fun attachExposureReadback(analysis: ImageAnalysis) {
+        try {
+            Camera2Interop.Extender(analysis).setSessionCaptureCallback(captureCallback)
+        } catch (e: Exception) {
+            Log.w(TAG, "exposure read-back not installed", e)
+        }
+    }
+
+    /**
+     * Apply the shutter speed chosen in Settings.
+     *
+     * Uses **session-level** [Camera2CameraControl] rather than a per-UseCase
+     * extender. AE mode is device-global state: if only ImageAnalysis requested
+     * `CONTROL_AE_MODE = OFF` while Preview kept `ON`, the two alternating
+     * repeating requests would fight, producing visible preview flicker and an
+     * exposure that jumps between the locked and automatic values. Setting it once
+     * at session scope applies to every use case, and — unlike rebinding — takes
+     * effect immediately without tearing down the camera.
+     */
+    @androidx.annotation.OptIn(
+        androidx.camera.camera2.interop.ExperimentalCamera2Interop::class
+    )
+    private fun applyShutter(camera: Camera) {
+        val speed = currentShutter
+        val control = try {
+            Camera2CameraControl.from(camera.cameraControl)
+        } catch (e: Exception) {
+            Log.w(TAG, "Camera2CameraControl unavailable; staying on AUTO", e)
+            return
+        }
+        currentIso = 0 // force the loop to re-seed from the controller
+        if (!speed.isManual) {
+            control.clearCaptureRequestOptions()
+            setShutterLocked(false)
+            appliedShutter = ShutterSpeed.AUTO
+            Log.i(TAG, "shutter=AUTO (AE in charge)")
+            return
+        }
+        val expMin = exposureRange?.lower?.toLong() ?: 0L
+        val expMax = exposureRange?.upper?.toLong() ?: 0L
+        val plan = planManualExposure(speed, expMin, expMax, supportsManualSensor)
+        if (!plan.ok) {
+            // Never pretend: fall back to AUTO and say why.
+            control.clearCaptureRequestOptions()
+            setShutterLocked(false)
+            appliedShutter = ShutterSpeed.AUTO
+            Log.w(TAG, "shutter ${speed.label} unsupported: ${plan.problem}; staying on AUTO")
+            updateUi { it.copy(statusText = "本机不支持固定快门") }
+            return
+        }
+        if (plan.clamped) {
+            Log.w(TAG, "shutter ${speed.label} clamped to ${plan.exposureNanos}ns by sensor range")
+        }
+        val iso = seedIso()
+        val opts = CaptureRequestOptions.Builder()
+            .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+            .setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, plan.exposureNanos)
+            .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
+            .build()
+        // `setCaptureRequestOptions` replaces the bundle outright; `add` would merge
+        // with whatever was applied before (e.g. a previous ISO from the auto loop),
+        // leaving stale keys behind when switching presets.
+        control.setCaptureRequestOptions(opts)
+        setShutterLocked(true)
+        appliedShutter = speed
+        currentIso = iso
+        Log.i(TAG, "shutter applied: ${speed.label} (${plan.exposureNanos}ns) iso=$iso")
+    }
+
+    /**
+     * Single place that flips the "shutter locked" state.
+     *
+     * Two consumers must agree: this Activity (for the UI read-out) and the
+     * analyzer (which skips luma sampling unless a fixed shutter is active).
+     * Updating them through one setter prevents the two from drifting apart.
+     */
+    private fun setShutterLocked(locked: Boolean) {
+        shutterLocked = locked
+        boundAnalyzer?.shutterLocked = locked
+    }
+
+    /** First ISO guess for a fixed shutter: mid-range, then corrected by the loop. */
+    private fun seedIso(): Int {
+        val r = sensitivityRange
+        if (r == null) return 400
+        val min = r.lower
+        val max = r.upper
+        if (max < min || min <= 0) return 400
+        // Start at half the range: a locked 1/60s on a typical indoor screen lands
+        // near there, so the controller converges in a couple of frames either way.
+        return (min + (max - min) / 2).coerceIn(min, max)
+    }
+
+    /** Auto-ISO feedback, called (throttled) from the analysis thread. */
+    private fun onAnalysisLuma(mean: Double) {
+        val camera = boundCamera ?: return
+        if (!shutterLocked) return
+        val r = sensitivityRange ?: return
+        val current = currentIso
+        if (current <= 0) return
+        val next = nextAutoIso(mean, current, r.lower, r.upper)
+        if (next == current) return
+        currentIso = next
+        try {
+            val opts = CaptureRequestOptions.Builder()
+                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                .setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, appliedShutter.nanos)
+                .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, next)
+                .build()
+            Camera2CameraControl.from(camera.cameraControl).setCaptureRequestOptions(opts)
+        } catch (e: Exception) {
+            Log.w(TAG, "auto-iso update failed", e)
+        }
+    }
+
 
     private var lastUiUpdate = 0L
     /** Written on the main thread AND from ioExecutor (recovery failure /
@@ -1590,6 +1990,17 @@ class ScanActivity : ComponentActivity() {
     // refreshOverlay / dedupeSparksBySlot 已移除（火花动画已删除）。
     override fun onResume() {
         super.onResume()
+        // Re-read the shutter preference: the user may have changed it in
+        // SettingsActivity and navigated back. Re-applying is cheap and takes
+        // effect without rebinding the camera.
+        val saved = ShutterSpeed.fromPref(
+            getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+                .getString(ShutterSpeed.PREF_KEY, null)
+        )
+        if (saved != currentShutter) {
+            currentShutter = saved
+            boundCamera?.let { applyShutter(it) }
+        }
         // If returning from ReceiveDetailActivity after completion, reset for next scan.
         if (completedHandled) {
             // Never wait on the ingest lock on the main thread — an in-flight
@@ -1609,6 +2020,8 @@ class ScanActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        exposureTicker?.let { exposureTickHandler.removeCallbacks(it) }
+        exposureTicker = null
         cameraExecutor.shutdown()
         // Snapshot the native-session owner and decode pool to locals, then drop
         // the Activity fields so any post-destroy callback / Activity-recreation
@@ -1653,6 +2066,18 @@ class ScanActivity : ComponentActivity() {
 
     companion object {
         private const val TAG = "ScanActivity"
+
+        /** SharedPreferences file shared with SettingsActivity. */
+        private const val PREFS_NAME = "airferry"
+
+        /**
+         * Last-resort fps range, used only when the device advertises no ranges at
+         * all or rejects the capability-derived one. `[15,30]` is the Camera2
+         * baseline range every device must support (SENSOR_INFO_MAX_FRAME_DURATION
+         * guarantees 30fps at 1080p), so it is far safer than the previous
+         * hard-coded `[60,60]`.
+         */
+        private val DEFAULT_FPS_RANGE = Range(15, 30)
         /**
          * Sliding window for decode rate + wire throughput shown in the info card.
          * ~3s is responsive enough to feel "live" without jittering every tick.
@@ -1660,6 +2085,8 @@ class ScanActivity : ComponentActivity() {
         private const val RATE_WINDOW_MS = 3_000L
         /** Minimum Δt before publishing a rate (avoids 1-tick spikes). */
         private const val RATE_MIN_DT_MS = 300L
+        /** Refresh period of the idle exposure read-out. */
+        private const val EXPOSURE_TICK_MS = 1000L
         /** Default display/store name when an older TEXT descriptor has no filename. */
         private const val TEXT_RECEIVED_NAME = "文字消息.txt"
 
@@ -1676,6 +2103,18 @@ class ScanActivity : ComponentActivity() {
             val m = totalSec / 60
             val s = totalSec % 60
             return "${m} 分 ${s.toString().padStart(2, '0')} 秒"
+        }
+
+        /**
+         * Format an exposure time in nanoseconds as a shutter fraction ("1/60",
+         * "1/33"), rounding to the nearest integer denominator so 30.0ms renders
+         * as "1/33" and 33.35ms (a full 30fps frame period) as "1/30" — matching
+         * how camera apps display it.
+         */
+        fun formatShutter(nanos: Long): String {
+            if (nanos <= 0) return "—"
+            val denom = (1_000_000_000.0 / nanos).toInt().coerceAtLeast(1)
+            return "1/$denom"
         }
 
         fun crc32OfBytes(data: ByteArray): Long {
