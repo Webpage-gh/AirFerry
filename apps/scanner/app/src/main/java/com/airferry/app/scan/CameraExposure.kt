@@ -38,7 +38,10 @@ package com.airferry.app.scan
  */
 enum class ShutterSpeed(val label: String, val nanos: Long) {
     /** Camera-controlled exposure (the behavior of every release through v1.2.9). */
-    AUTO("自动", AUTO_NANOS),
+    // Literal 0 (not AUTO_NANOS): enum entry arguments are evaluated before the
+    // companion object is initialized, so referencing a companion constant here
+    // is a compile error ("Companion object is uninitialized here").
+    AUTO("自动", 0L),
 
     /** Locked 1/60s — fast enough to suppress hand-shake smear on a 30fps sensor. */
     S60("1/60", 16_666_666L),

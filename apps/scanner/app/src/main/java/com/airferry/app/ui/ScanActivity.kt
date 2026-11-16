@@ -655,24 +655,35 @@ class ScanActivity : ComponentActivity() {
                         .also { builder ->
                             // Pin the sensor frame-rate via Camera2Interop (CameraX
                             // 1.3.x has no public ImageAnalysis#setTargetFrameRate).
-                            Camera2Interop.Extender(builder).setCaptureRequestOption(
+                            val ext = Camera2Interop.Extender(builder)
+                            ext.setCaptureRequestOption(
                                 CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
                                 fpsRange
                             )
+                            // Exposure read-back must be registered on the *builder*:
+                            // Camera2Interop.Extender takes an ExtendableBuilder, and
+                            // the built ImageAnalysis is not one.
+                            ext.setSessionCaptureCallback(captureCallback)
                         }
                         .build()
-                        .also {
-                            attachExposureReadback(it)
-                            it.setAnalyzer(cameraExecutor, analyzer)
-                        }
+                        .also { it.setAnalyzer(cameraExecutor, analyzer) }
 
-                // Camera2 view of the selected camera — source of the exposure and
+                // Camera2 view of the back camera — source of the exposure and
                 // frame-rate capabilities used below (and by the settings screen).
-                val cam2Info = Camera2CameraInfo.from(
-                    cameraProvider.getCameraInfo(CameraSelector.DEFAULT_BACK_CAMERA)
-                )
-                readCameraCapabilities(cam2Info)
-                val fpsRange = chooseFpsRange(cam2Info)
+                // `ProcessCameraProvider` has no `getCameraInfo(selector)`; the
+                // supported route is `availableCameraInfos` filtered by the same
+                // selector we bind with (it may yield several cameras on logical
+                // devices, so take the first).
+                val backSelector = CameraSelector.DEFAULT_BACK_CAMERA
+                val camInfo = cameraProvider.availableCameraInfos
+                    .firstOrNull { backSelector.filter(listOf(it)).isNotEmpty() }
+                val cam2Info = camInfo?.let { Camera2CameraInfo.from(it) }
+                if (cam2Info != null) {
+                    readCameraCapabilities(cam2Info)
+                } else {
+                    Log.w(TAG, "back camera info not found; shutter presets unavailable")
+                }
+                val fpsRange = cam2Info?.let { chooseFpsRange(it) } ?: DEFAULT_FPS_RANGE
 
                 cameraProvider.unbindAll()
                 val camera = try {
@@ -793,25 +804,6 @@ class ScanActivity : ComponentActivity() {
         val best = ranges.maxWithOrNull(compareBy({ it.upper }, { -it.lower })) ?: DEFAULT_FPS_RANGE
         Log.i(TAG, "fps range chosen=[${best.lower} ${best.upper}] (from ${ranges.size} advertised)")
         return best
-    }
-
-    /**
-     * Install the per-frame exposure read-back callback.
-     *
-     * Registered on the ImageAnalysis use case (the stream we actually care about)
-     * rather than the camera as a whole, because CameraX surfaces CaptureResults
-     * per use case. Values land in [actualExposureNanos]/[actualIso] and are picked
-     * up by the throttled UI refresh.
-     */
-    @androidx.annotation.OptIn(
-        androidx.camera.camera2.interop.ExperimentalCamera2Interop::class
-    )
-    private fun attachExposureReadback(analysis: ImageAnalysis) {
-        try {
-            Camera2Interop.Extender(analysis).setSessionCaptureCallback(captureCallback)
-        } catch (e: Exception) {
-            Log.w(TAG, "exposure read-back not installed", e)
-        }
     }
 
     /**
