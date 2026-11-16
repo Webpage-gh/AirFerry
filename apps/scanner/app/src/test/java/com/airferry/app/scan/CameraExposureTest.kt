@@ -23,13 +23,16 @@ class CameraExposureTest {
     }
 
     @Test
-    fun presetsAreManualAndOrderedFastestToSlowestNanos() {
+    fun presetsAreManualAndOrderedSlowestToFastest() {
         val manual = ShutterSpeed.selectable.filter { it.isManual }
         assertTrue("expected several presets", manual.size >= 3)
-        // Ascending nanos == descending shutter speed.
+        // The UI lists 1/60 -> 1/500, i.e. exposure time *decreases* monotonically.
+        // Assert the real guarantee: labels read fastest-last and nanos descend.
         val nanos = manual.map { it.nanos }
-        assertEquals(nanos.sorted(), nanos)
+        assertEquals(nanos.sortedDescending(), nanos)
         assertTrue(manual.all { it.nanos > 0 })
+        // AUTO is offered first so the default is the first radio button.
+        assertEquals(ShutterSpeed.AUTO, ShutterSpeed.selectable.first())
     }
 
     @Test
